@@ -2,7 +2,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import date, timedelta
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
+
+# In-memory stores (reset on server restart)
+restocking_orders = []
+tasks = []
+_task_id_counter = 1
 
 app = FastAPI(title="Factory Inventory Management System")
 
@@ -119,6 +125,30 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class Task(BaseModel):
+    id: int
+    title: str
+    priority: str
+    dueDate: str
+    status: str
+
+class CreateTaskRequest(BaseModel):
+    title: str
+    priority: str
+    dueDate: str
+
+class RestockingOrderItem(BaseModel):
+    sku: str
+    name: str
+    category: str
+    warehouse: str
+    quantity: int
+    unit_cost: float
+
+class PlaceRestockingOrderRequest(BaseModel):
+    items: List[RestockingOrderItem]
+    budget: float
 
 # API endpoints
 @app.get("/")
@@ -303,6 +333,144 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking/recommendations")
+def get_restocking_recommendations(budget: float = 25000):
+    """Return items below reorder point, ranked by low-stock + demand trend, greedy-fit within budget."""
+    demand_by_sku = {f['item_sku']: f for f in demand_forecasts}
+
+    candidates = []
+    for item in inventory_items:
+        if item['quantity_on_hand'] >= item['reorder_point']:
+            continue
+
+        forecast = demand_by_sku.get(item['sku'])
+        trend = forecast['trend'] if forecast else 'stable'
+
+        # Bring stock to reorder_point plus a 20% safety buffer
+        restock_qty = (item['reorder_point'] - item['quantity_on_hand']) + int(item['reorder_point'] * 0.2)
+        restock_cost = round(restock_qty * item['unit_cost'], 2)
+
+        # Score: increasing trend and critically low stock rank highest
+        score = 0
+        if trend == 'increasing':
+            score += 3
+        elif trend == 'stable':
+            score += 1
+        stock_ratio = item['quantity_on_hand'] / item['reorder_point'] if item['reorder_point'] > 0 else 1
+        if stock_ratio < 0.5:
+            score += 2
+        elif stock_ratio < 0.75:
+            score += 1
+
+        priority = 'high' if score >= 4 else ('medium' if score >= 2 else 'low')
+
+        candidates.append({
+            'id': item['id'],
+            'sku': item['sku'],
+            'name': item['name'],
+            'category': item['category'],
+            'warehouse': item['warehouse'],
+            'quantity_on_hand': item['quantity_on_hand'],
+            'reorder_point': item['reorder_point'],
+            'unit_cost': item['unit_cost'],
+            'restock_quantity': restock_qty,
+            'restock_cost': restock_cost,
+            'trend': trend,
+            'priority': priority,
+            'priority_score': score,
+        })
+
+    candidates.sort(key=lambda x: x['priority_score'], reverse=True)
+
+    # Greedy fit: include items in priority order until budget is exhausted
+    remaining = budget
+    result = []
+    for c in candidates:
+        included = c['restock_cost'] <= remaining
+        if included:
+            remaining -= c['restock_cost']
+        result.append({**c, 'included': included})
+
+    return {
+        'recommendations': result,
+        'budget': budget,
+        'total_cost': round(budget - remaining, 2),
+        'items_included': sum(1 for r in result if r['included']),
+        'items_excluded': sum(1 for r in result if not r['included']),
+    }
+
+
+@app.post("/api/restocking/orders")
+def place_restocking_order(request: PlaceRestockingOrderRequest):
+    """Submit a restocking order; stores in memory with a 14-day lead time."""
+    today = date.today()
+    expected = today + timedelta(days=14)
+
+    seq = len(restocking_orders) + 1
+    order = {
+        'id': f'rst-{seq:03d}',
+        'order_number': f'RST-{seq:04d}',
+        'customer': 'Internal - Restocking',
+        'items': [
+            {'name': i.name, 'sku': i.sku, 'quantity': i.quantity, 'unit_price': i.unit_cost}
+            for i in request.items
+        ],
+        'status': 'Submitted',
+        'order_date': today.isoformat(),
+        'expected_delivery': expected.isoformat(),
+        'total_value': round(sum(i.quantity * i.unit_cost for i in request.items), 2),
+        'warehouse': 'Multiple',
+        'category': 'Restocking',
+        'budget': request.budget,
+        'lead_time_days': 14,
+        'type': 'restocking',
+    }
+    restocking_orders.append(order)
+    return order
+
+
+@app.get("/api/restocking/orders")
+def get_restocking_orders():
+    """Return all submitted restocking orders."""
+    return restocking_orders
+
+
+@app.get("/api/tasks", response_model=List[Task])
+def get_tasks():
+    return tasks
+
+@app.post("/api/tasks", response_model=Task, status_code=201)
+def create_task(request: CreateTaskRequest):
+    global _task_id_counter
+    task = {
+        "id": _task_id_counter,
+        "title": request.title,
+        "priority": request.priority,
+        "dueDate": request.dueDate,
+        "status": "pending"
+    }
+    _task_id_counter += 1
+    tasks.append(task)
+    return task
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: int):
+    global tasks
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    tasks = [t for t in tasks if t["id"] != task_id]
+    return {"ok": True}
+
+@app.patch("/api/tasks/{task_id}", response_model=Task)
+def toggle_task(task_id: int):
+    task = next((t for t in tasks if t["id"] == task_id), None)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task["status"] = "completed" if task["status"] == "pending" else "pending"
+    return task
+
 
 if __name__ == "__main__":
     import uvicorn

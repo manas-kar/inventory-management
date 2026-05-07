@@ -8,6 +8,39 @@
     <div v-if="loading" class="loading">{{ t('common.loading') }}</div>
     <div v-else-if="error" class="error">{{ error }}</div>
     <div v-else>
+      <div v-if="restockingOrders.length > 0" class="card submitted-orders-card">
+        <div class="card-header">
+          <h3 class="card-title">Submitted Orders</h3>
+          <span class="submitted-subtitle">Restocking orders placed via the Restocking tab</span>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Order #</th>
+                <th>Items</th>
+                <th>Status</th>
+                <th>Order Date</th>
+                <th>Expected Delivery</th>
+                <th>Lead Time</th>
+                <th>Total Value</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="order in restockingOrders" :key="order.id">
+                <td><strong>{{ order.order_number }}</strong></td>
+                <td>{{ order.items.length }} items</td>
+                <td><span class="badge info">{{ order.status }}</span></td>
+                <td>{{ formatDate(order.order_date) }}</td>
+                <td>{{ formatDate(order.expected_delivery) }}</td>
+                <td>{{ order.lead_time_days }} days</td>
+                <td><strong>${{ order.total_value.toLocaleString() }}</strong></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="stats-grid">
         <div class="stat-card success">
           <div class="stat-label">{{ t('status.delivered') }}</div>
@@ -80,6 +113,7 @@
 
 <script>
 import { ref, onMounted, watch, computed } from 'vue'
+import axios from 'axios'
 import { api } from '../api'
 import { useFilters } from '../composables/useFilters'
 import { useI18n } from '../composables/useI18n'
@@ -95,6 +129,16 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+
+    const restockingOrders = ref([])
+    const loadRestockingOrders = async () => {
+      try {
+        const res = await axios.get('http://localhost:8001/api/restocking/orders')
+        restockingOrders.value = res.data
+      } catch (err) {
+        console.error('Failed to load restocking orders:', err)
+      }
+    }
 
     // Use shared filters
     const {
@@ -153,13 +197,17 @@ export default {
       })
     }
 
-    onMounted(loadOrders)
+    onMounted(() => {
+      loadOrders()
+      loadRestockingOrders()
+    })
 
     return {
       t,
       loading,
       error,
       orders,
+      restockingOrders,
       getOrdersByStatus,
       getOrderStatusClass,
       formatDate,
@@ -172,6 +220,16 @@ export default {
 </script>
 
 <style scoped>
+.submitted-subtitle {
+  font-size: 0.875rem;
+  color: #64748b;
+}
+
+.submitted-orders-card {
+  border-color: #bfdbfe;
+  margin-bottom: 1.25rem;
+}
+
 /* Fixed table layout to prevent column shifting */
 .orders-table {
   table-layout: fixed;
